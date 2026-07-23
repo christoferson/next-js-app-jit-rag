@@ -1,390 +1,425 @@
-# SPEC.md — Ephemeral RAG Console (Session-Scoped FAISS)
+# SPEC.md — Notebook RAG Console (All-TypeScript, LanceDB + Bedrock)
 
 ## 1. Overview
 
-A local-first web application that gives each browser session its own **ephemeral Retrieval-Augmented Generation database**. A user opens the app, uploads one or more documents, and immediately chats/queries over their contents. Behind the scenes, the backend parses each file, chunks and embeds it, and builds a **per-session FAISS index held entirely in memory**. Queries embed the question, retrieve the top-k chunks from that session's index, and stream a grounded LLM answer with citations back to the UI.
+A single **Next.js (TypeScript)** application — a document-research console in the spirit of NotebookLM, built on **well-maintained OSS primitives** rather than a hosted RAG service. A user creates a **notebook** (a provisioned-on-the-fly vector collection), uploads documents into it, and queries/analyzes them with a grounded, streaming, citation-rich chat. Notebooks are **persistent** (file-backed) and deleted only explicitly.
 
-Nothing is persisted. A session — and its FAISS index, decoded documents, and temp files — is destroyed the moment the user **ends the session**, closes the tab, or lets it sit **idle for 5 minutes**. There are no user accounts, no shared indexes, and no on-disk vector store that survives a restart.
+The application's **core value and differentiator is its chunking system**: a **Strategy pattern** where chunking behavior (fixed-size, recursive, delimiter, and later per-page/per-row) is selectable per document — either chosen by the user or defaulted by file type — with each strategy exposing a self-describing config schema that drives the UI, server validation, and stored provenance. Chunk provenance (page, offset, etc.) flows into citations so answers cite meaningful locations, not opaque chunk numbers.
 
-Two-service architecture: a **Python FastAPI backend** (owns FAISS, embeddings, parsing, LLM calls, and the session reaper) and a **Next.js frontend** (upload, chat, session status). Run both with a single `make dev` / `docker compose up`.
+Everything runs in **one process** with **no external servers**: metadata lives in **file-based repositories** (JSON, atomic writes), vectors live in **per-notebook LanceDB tables on local disk**, embeddings come from **Amazon Bedrock**. Setup is two commands: `npm install`, `npm run dev`.
 
-Four architectural mandates:
+The system is **multi-user by design, single-node by runtime**: every entity and storage path is keyed by `userId`, but auth is a stub (`local-user`) behind an `AuthProvider` seam. Swapping file→Postgres, local→S3, LanceDB→OpenSearch, or stub→Cognito are **implementation swaps behind interfaces**, never rewrites.
 
-1. **Provider Registry**: embedding and LLM behavior (which model, dimensions, context window, request params, availability) is modeled as typed metadata. All provider-specific behavior — index dimensionality, request fields, validation, UI options — is driven by this registry, never hardcoded at call sites. **Adding a model/provider = one registry entry.**
-2. **Ephemeral by construction**: session state (FAISS index + doc store + file bytes) lives **only in process memory / a per-session temp dir**. There is no durable database. Eviction (idle, explicit, or shutdown) must free all memory and delete all temp files — verifiable. A restart starts empty.
-3. **Defensive ingestion**: uploaded files are heterogeneous and hostile (wrong extensions, corrupt PDFs, empty docs, huge files, mixed encodings). Every parser/loader must degrade gracefully — **never crash the server on a bad file**; a bad file is rejected per-file with a readable reason, and other files in the same upload still succeed.
-4. **Ideal, stylish UI**: dark-first console aesthetic, live upload/ingestion progress, animated streaming answers with inline citations, a visible **session countdown timer**, keyboard-friendly. UI quality is a first-class requirement (see §7).
+Five architectural mandates:
 
-Default config via environment. Credentials (e.g. OpenAI key) via env, server-only.
+1. **Layered by Facade → Service → Repository.** Route handlers are thin (validate + delegate + stream). Facades orchestrate use-cases. Services hold business logic. Repositories abstract storage. No layer reaches past its neighbor.
+2. **Chunking is a first-class Strategy Registry.** Adding a chunking strategy = one class + one registry entry. **No `if (strategy === …)` at call sites.** Same for the Bedrock model registry.
+3. **Storage behind interfaces (Repository/Adapter).** File-based repos + LanceDB + local uploader + stub auth today; Postgres/OpenSearch/S3/Cognito later — **same interfaces**.
+4. **Defensive ingestion.** Files are heterogeneous/hostile (corrupt PDFs, empty docs, bad encodings, oversize). A bad file fails **per-document** with a readable reason inside an async job; it never crashes the server or a sibling document.
+5. **Ideal, stylish UI.** Dark-first console aesthetic, notebook workspace, live ingestion progress, animated streaming answers with expandable inline citations, keyboard-friendly. UI quality is first-class (§7).
+
+Region via `AWS_REGION`; credentials via local `AWS_PROFILE` (SSO supported). Bedrock clients are **server-only** — never in the client bundle.
 
 ## 2. Goals & Non-Goals
 
 ### Goals
 
-- **Session bootstrap**: on first load, the client obtains a `sessionId` (server-issued UUID) bound to an in-memory session. The `sessionId` is the only key the client holds.
-- **Multi-file upload**: drag-and-drop or picker; 1..N files per upload, repeatable (add more files to an existing session's index). Supported types: `.pdf`, `.txt`, `.md`, `.docx`, `.csv`, `.html` (see §5.1). Per-file size cap and per-session total cap from config.
-- **Ingestion pipeline**: parse → normalize text → chunk (configurable size/overlap) → embed → add to the session's FAISS index, with per-file, **streamed progress** (parsing → chunking → embedding → indexed) and per-file chunk counts.
-- **RAG query with streaming**: embed the query, retrieve top-k chunks (configurable k, optional score threshold), build a grounded prompt, stream the LLM answer token-by-token, and return **citations** (source filename + chunk index + snippet + similarity score) that the UI can render inline and expand.
-- **Session dashboard**: show session ID, uploaded files (name, size, chunk count, status), total chunks/vectors, index dimensionality/provider, **idle countdown to expiry**, and controls to add files, clear the index, or end the session.
-- **Explicit + implicit teardown**:
-  - **End Session** button → immediate server-side eviction (free FAISS, delete temp dir).
-  - **Tab close / navigate away** → `navigator.sendBeacon` best-effort end.
-  - **Idle 5 min** → background reaper evicts; the client, on its next call, receives `410 Gone` and offers to start a fresh session.
-- **Activity-based TTL refresh**: any successful query/upload/heartbeat resets the session's idle timer server-side; the UI countdown reflects `expiresAt` from the server.
-- **Graceful error surfacing**: parse failures, embedding/LLM provider errors (auth, rate limit, timeout), expired sessions, and oversized uploads all render as readable in-UI messages — request-level AND in-stream.
+- **Notebook lifecycle**: create (name + embedding model → fixes vector dimension), list, open, **explicit delete** (removes metadata + LanceDB table + uploads). Notebooks persist indefinitely; no idle eviction.
+- **Document upload & async ingestion**: 1..N files per notebook; each file becomes an **ingestion job** (parse → chunk → embed → store) run as an **in-process background task** with streamed/polled progress and per-document status.
+- **Chunking strategy system (the centerpiece)**:
+  - A registry of strategies, each `applicable_to(fileType)` with a self-describing `configSchema`.
+  - **Two selection modes**: user picks a strategy (+ config) per document, OR the system applies a **default strategy per file type**.
+  - v1 strategies: `fixed_size`, `recursive`, `delimiter`, `pdf_one_per_page`.
+  - Chunks carry rich **provenance** (`page`, `charStart/charEnd`, ordinal, custom metadata) → surfaced in citations.
+  - Strategy + config is recorded **per document** (a notebook can mix strategies across its documents).
+- **Grounded streaming query**: embed query → vector search in the notebook's LanceDB table (top-k + optional score threshold, optional metadata filter) → build grounded prompt → stream answer token-by-token → emit **citations** (document, page/location, snippet, similarity score) rendered as expandable inline markers `[1]…[k]`.
+- **Bedrock provider registry**: embedding models (Titan Text V2 etc.) modeled as typed metadata that fixes index dimensionality and gates behavior. Generation LLM likewise. **Adding a model = one registry entry.**
+- **Document management within a notebook**: list documents (name, size, strategy, chunk count, status), delete a document (removes its chunks from the table), re-ingest with a different strategy.
+- **Multi-user data model**: all entities keyed by `userId`; storage paths namespaced by user; `AuthProvider` stub returns `local-user`.
+- **Graceful error surfacing**: parse failures, Bedrock errors (access denied, throttling, validation, timeout), oversize files, and missing notebooks render as readable in-UI messages — request-level AND in-stream.
 
 ### Non-Goals (v1 — design for, don't build)
 
-- Durable / cross-session vector storage, persistence, or resuming a session after server restart.
-- Auth / multi-user isolation beyond the opaque `sessionId` (single-tenant local tool; seam exists — §10).
-- Multi-modal input (images, audio); OCR of scanned PDFs.
-- Distributed / horizontally-scaled backend (single process; in-memory store — see §10 for the Redis/shared seam).
-- Fine-grained document management (rename, re-order, per-chunk editing).
-- Cost tracking, guardrails, evaluation harnesses.
-- Deployment/IaC/CI beyond a local `docker compose`.
+- Real auth / multi-tenant isolation enforcement (stub user; seam only — §10).
+- External servers (Postgres, OpenSearch, Redis) — file + LanceDB only.
+- Queue/worker infrastructure (SQS/Step Functions) — in-process jobs only.
+- Presigned/multipart S3 upload — direct upload with a 50MB cap.
+- PPTX / Office formats and multimodal (image) embeddings — **loader & embedding seams exist** for both.
+- Excel per-row strategy — designed for, added later as one strategy entry.
+- Notebook sharing/collaboration, versioning, S3 backup/restore.
+- Deployment/IaC/CI/Docker.
 
 ## 3. Architecture
 
 ```
-Browser (Next.js client — holds only sessionId + display state)
+Browser (React client — holds notebookId + display state; no AWS/vector code)
   │
-  │  POST /api/session                 → { sessionId, expiresAt, config }
-  │  POST /api/session/heartbeat       → { expiresAt }            (resets idle)
-  │  DELETE /api/session               → best-effort teardown (sendBeacon)
-  │  GET  /api/session/status          → files, counts, expiresAt
-  │  POST /api/upload  (multipart)     → SSE ingestion progress per file
-  │  POST /api/query                   → { question, topK } → SSE answer + citations
-  │  POST /api/clear                   → drop index, keep session
-  │  GET  /api/providers               → client-safe provider registry
+  │  POST   /api/notebooks                 create { name, embeddingModelId }
+  │  GET    /api/notebooks                 list (for current user)
+  │  GET    /api/notebooks/[id]            open (metadata + documents + totals)
+  │  DELETE /api/notebooks/[id]            explicit delete (metadata + table + uploads)
+  │  POST   /api/notebooks/[id]/documents  upload (multipart) → { jobId }  (202)
+  │  GET    /api/jobs/[id]                 poll ingestion job status/progress
+  │  GET    /api/jobs/[id]/stream          SSE ingestion progress (optional)
+  │  DELETE /api/notebooks/[id]/documents/[docId]   remove doc + its chunks
+  │  POST   /api/notebooks/[id]/query      { question, topK, filter } → SSE answer+citations
+  │  GET    /api/strategies                strategy registry (client-safe)
+  │  GET    /api/models                    Bedrock model registry (client-safe)
   ▼
-FastAPI backend (single process — owns all state)
-  ├── session/manager.py       SessionManager: in-mem dict, locks, TTL, reaper
-  ├── session/store.py         SessionStore: FAISS index + DocStore + temp dir
-  ├── rag/loaders.py           defensive per-type file → text (pure-ish)
-  ├── rag/chunker.py           text → chunks (size/overlap)
-  ├── rag/embeddings.py        provider-driven embed(texts) -> np.ndarray
-  ├── rag/index.py             FAISS build/add/search wrapper (per session)
-  ├── rag/generate.py          prompt build + streaming LLM adapter
-  ├── providers/registry.py    typed embedding+LLM metadata (data only)
-  └── providers/validate.py    request validation built from registry
+Next.js route handlers (Node runtime — server-only)
+  ├── validate (zod) + resolve user (AuthProvider) + delegate to Facade + stream
   ▼
-SSE back to client (ingestion progress, text deltas, citations, usage, errors)
-
-Background: reaper task (asyncio) sweeps every REAPER_INTERVAL for idle sessions.
+FACADE   lib/facade/notebook-facade.ts
+  createNotebook · listNotebooks · openNotebook · deleteNotebook
+  ingestDocument · getJob · deleteDocument · query           (orchestrates services)
+  ▼
+SERVICES lib/services/*
+  NotebookService     lifecycle; fixes embeddingModel/dim at creation
+  IngestionService    Template Method: parse → chunk → embed → store; drives JobService
+  ChunkingService     Strategy + Factory + Registry; selection (explicit | by-type default)
+  EmbeddingService    Adapter over Bedrock; batched; asserts dim == notebook.dim
+  QueryService        embed → vector search → prompt build → stream generation
+  JobService          async job registry + progress (Observer/callbacks)
+  ▼
+REPOSITORIES / ADAPTERS lib/repositories/*  lib/adapters/*
+  NotebookRepository · DocumentRepository · JobRepository   (FILE impls: JSON + atomic write + lock)
+  VectorStore                                               (LanceDBVectorStore)
+  Uploader                                                  (LocalDiskUploader)
+  AuthProvider                                              (StubAuthProvider → local-user)
+  BedrockEmbeddingAdapter · BedrockLLMAdapter               (AWS SDK v3, server-only)
+  ▼
+Local disk: ./data/users/{userId}/notebooks/{notebookId}/{notebook.json, documents/, lancedb/, uploads/}
+            ./data/users/{userId}/jobs/{jobId}.json
+Bedrock:    embeddings + generation (AWS_PROFILE / AWS_REGION)
 ```
 
-- **Stateful backend, ephemeral state**: unlike a stateless service, the backend deliberately holds per-session state in memory — but that state is disposable and TTL-bounded. Every request carries `sessionId`; the manager resolves it, refreshing its `last_activity`.
-- **Layering**:
-  - `session/*` — lifecycle, concurrency, memory/temp ownership. Only place that creates/destroys FAISS indexes and temp dirs.
-  - `rag/*` — as-pure-as-possible transforms (loaders, chunker) and thin provider wrappers (embeddings, generate). No web framework imports.
-  - `providers/*` — registry (data) + validation. No `if provider == ...` at call sites.
-  - Route handlers — validation (Pydantic) + wiring + SSE only.
-- **Streaming**: SSE with a typed event union shared by contract between server and client (`lib/events`):
-  - Ingestion: `file-start | file-progress | file-indexed | file-error | ingest-done`.
+- **Strict layering**: routes → facade → services → repositories/adapters. A route never imports a repository; a service never imports a route; components never touch AWS/LanceDB shapes.
+- **Streaming**: SSE with a typed event union shared across the app (`lib/stream/events.ts`):
+  - Ingestion job: `job-status | file-progress | doc-indexed | doc-error | job-done`.
   - Query: `retrieval | text-delta | citation | usage | done | error`.
 
-## 4. Session Lifecycle & Ephemeral Store (the core design)
+## 4. Layering, Patterns & Directory Contracts
 
-### 4.1 Session state
+### 4.1 Patterns in use (named, justified)
 
-```py
-# session/store.py
-@dataclass
-class SessionStore:
-    session_id: str
-    created_at: float
-    last_activity: float          # refreshed on every successful op
-    ttl_seconds: int              # default 300 (5 min)
-    temp_dir: Path                # per-session; deleted on eviction
-    index: faiss.Index | None     # IndexFlatIP over normalized embeddings
-    dim: int                      # from embedding provider registry
-    docs: DocStore                # chunk_id -> {file, chunk_index, text, char_span}
-    files: list[FileRecord]       # name, bytes, sha256, status, chunk_count
-    lock: asyncio.Lock            # serialize add/search per session
+| Pattern | Where | Why |
+|---|---|---|
+| **Facade** | `lib/facade/notebook-facade.ts` | Single coarse use-case API; routes stay thin; orchestration centralized |
+| **Service** | `lib/services/*` | One responsibility each; business logic isolated from storage + web |
+| **Repository** | `lib/repositories/*` | Storage-agnostic CRUD; file→Postgres is a swap |
+| **Strategy** | `lib/chunking/strategies/*` | Interchangeable chunking algorithms — the core feature |
+| **Registry** | `lib/chunking/registry.ts`, `lib/models/registry.ts` | Strategies & models as data; add = one entry |
+| **Factory** | `lib/chunking/factory.ts`, `lib/models/factory.ts` | Resolve registry id → concrete instance; no `if` at call sites |
+| **Adapter** | `lib/adapters/*` | Wrap Bedrock/LanceDB SDKs behind our interfaces |
+| **Template Method** | `IngestionService.run()` | Fixed pipeline (parse→chunk→embed→store); chunk step delegated to Strategy |
+| **Observer/Callback** | `JobService` progress | Ingestion emits progress; persisted for polling/SSE |
+
+### 4.2 Layer rules (non-negotiable)
+
+- Route handlers: zod validation, `AuthProvider.currentUser()`, one Facade call, SSE plumbing. **No business logic.**
+- Facade: composes services for a use-case; owns cross-service orchestration + transaction-like ordering (e.g. write doc metadata *after* successful indexing). No storage calls directly — goes through services.
+- Services: pure-ish business logic; depend on repository/adapter **interfaces**, never concrete impls (constructor-injected).
+- Repositories/Adapters: the only code touching the filesystem, LanceDB, or AWS SDKs. All AWS error mapping lives in adapters.
+- Components: render typed DTOs only; never see AWS/LanceDB/raw JSON shapes.
+
+## 5. Chunking Strategy System (the bread and butter)
+
+### 5.1 Core types
+
+```ts
+// lib/chunking/types.ts
+export interface ParsedElement {          // loader output — structural unit pre-chunk
+  kind: 'page' | 'paragraph' | 'text' | 'row';   // 'slide' | 'row' reserved for later
+  text: string;
+  metadata: Record<string, unknown>;      // e.g. { page: 12 }
+}
+
+export interface Chunk {
+  ordinal: number;                         // sequence within the document
+  text: string;
+  metadata: {                              // provenance → flows into citations
+    page?: number;
+    charStart?: number;
+    charEnd?: number;
+    [k: string]: unknown;
+  };
+}
+
+export interface StrategyConfigField {     // drives UI + zod validation
+  key: string;
+  label: string;
+  type: 'number' | 'string' | 'boolean' | 'select';
+  default: unknown;
+  min?: number; max?: number; step?: number;
+  options?: { value: string; label: string }[];
+  help?: string;
+}
+
+export interface ChunkingStrategy {
+  id: string;                              // 'fixed_size'
+  displayName: string;
+  description: string;
+  applicableTo(fileType: string): boolean; // 'txt' | 'pdf' | ...
+  configSchema(): StrategyConfigField[];   // self-describing config
+  chunk(elements: ParsedElement[], config: Record<string, unknown>): Chunk[];
+}
 ```
 
-- **Index type**: `IndexFlatIP` on L2-normalized vectors (cosine similarity) — exact, no training, ideal for small ephemeral corpora. Registry may specify `IndexHNSWFlat` for large sessions later (seam).
-- **DocStore**: parallel array/dict mapping FAISS row → chunk metadata; FAISS stores only vectors, DocStore stores text + provenance for citations.
+### 5.2 Seed strategies (v1)
 
-### 4.2 Manager rules
+| id | displayName | applicable | config | behavior |
+|---|---|---|---|---|
+| `fixed_size` | Fixed size | all | `size`(chars/tokens), `overlap`, `unit` | Sliding window; overlap carried; splits across element boundaries |
+| `recursive` | Recursive (smart) | all | `size`, `overlap`, `separators[]` | Split on paragraph→sentence→word, packing up to `size` |
+| `delimiter` | Delimiter | txt, md, csv | `delimiter`, `keepDelimiter` | Split on a literal/regex delimiter (e.g. `\n\n`, `---`) |
+| `pdf_one_per_page` | One chunk per page | pdf | `mergeShortPages`(bool), `minChars` | 1 chunk per PDF page; provenance `page` |
 
-```py
-# session/manager.py
-class SessionManager:
-    sessions: dict[str, SessionStore]
-    def create() -> SessionStore
-    def get(session_id) -> SessionStore            # raises SessionExpired -> 410
-    def touch(session_id)                          # last_activity = now
-    async def evict(session_id, reason)            # free index, rm temp_dir
-    async def reap()                               # evict idle > ttl
+**Reserved (later, one entry each):** `pptx_one_per_slide` (pptx), `excel_one_per_row` (xlsx/csv), `semantic` (all).
+
+### 5.3 Registry, Factory, selection
+
+```ts
+// lib/chunking/registry.ts
+export const CHUNKING_STRATEGIES: ChunkingStrategy[] = [ /* seed instances */ ];
+
+// default per file type (auto mode)
+export const DEFAULT_STRATEGY_BY_TYPE: Record<string, string> = {
+  txt: 'recursive',
+  md:  'recursive',
+  pdf: 'pdf_one_per_page',
+  csv: 'delimiter',
+  // pptx: 'pptx_one_per_slide',  // later
+  // xlsx: 'excel_one_per_row',   // later
+};
+
+// lib/chunking/factory.ts
+// resolve id → strategy; throw typed StrategyNotFound (never silent).
+// selection: explicit strategyId+config, else DEFAULT_STRATEGY_BY_TYPE[fileType].
 ```
 
-- **Idle expiry**: `now - last_activity > ttl_seconds` → evicted. `expiresAt = last_activity + ttl_seconds` is returned to the client on every response so the UI countdown is authoritative.
-- **`get()` on an evicted/unknown id → `SessionExpired` → HTTP `410 Gone`** with `{ code: "session_expired" }`. Never auto-recreate silently; the client decides.
-- **Eviction is total and verifiable**: drop the FAISS index reference, clear DocStore, `shutil.rmtree(temp_dir)`. Log `{session_id, reason, freed_vectors, files}`. Reasons: `explicit | idle | shutdown | error`.
-- **Reaper**: asyncio task started on app startup, runs every `REAPER_INTERVAL` (default 30s), evicts all idle sessions. On app shutdown, evict all sessions.
-- **Concurrency**: per-session `asyncio.Lock` guards index add/search so concurrent upload + query don't corrupt the index. Manager dict guarded by a global lock for create/evict.
-- **Caps**: reject uploads exceeding `MAX_FILE_MB` (per file) or `MAX_SESSION_MB` / `MAX_SESSION_CHUNKS` (per session) with a readable error; existing index untouched.
+### 5.4 Behavior rules
 
-### 4.3 Teardown paths (all must free everything)
+- **UI**: `/api/strategies` returns applicable strategies + `configSchema` for the uploaded file type; the composer renders controls from the schema (slider for `size`, input for `delimiter`, etc.). **No hardcoded per-strategy UI.**
+- **Server validation**: a zod schema is built **from the selected strategy's `configSchema`**; unknown fields stripped, ranges clamped. Never trust the client.
+- **Per-document record**: the chosen `strategyId` + resolved `config` is stored on the `Document` and echoed into each chunk's row metadata in LanceDB.
+- **Adding a strategy = one class implementing `ChunkingStrategy` + one registry entry (+ optional default-map entry).** Nothing else changes — UI, validation, provenance all derive from the interface.
+- **Provenance → citations**: chunk `metadata.page` (etc.) is stored per LanceDB row and returned in query citations so the UI can render "PDF p.14" instead of "chunk 87".
 
-| Trigger | Mechanism | Result |
-|---|---|---|
-| End Session button | `DELETE /api/session` | `evict(explicit)` immediately |
-| Tab close / unload | `navigator.sendBeacon('/api/session', ...)` | best-effort `evict(explicit)` |
-| Idle 5 min | reaper | `evict(idle)`; next client call → `410` |
-| Server shutdown | lifespan hook | `evict(shutdown)` for all |
-
-## 5. RAG Pipeline
-
-### 5.1 Loaders (`rag/loaders.py`) — defensive per-type
-
-| Type | Loader | Failure handling |
-|---|---|---|
-| `.txt`, `.md` | decode with `charset-normalizer` fallback chain | undecodable → `file-error` |
-| `.pdf` | `pypdf` (text extraction) | encrypted/scanned/empty text → `file-error("no extractable text")` |
-| `.docx` | `python-docx` | corrupt → `file-error` |
-| `.csv` | row-serialized to text | huge → truncate to cap, warn |
-| `.html` | `selectolax`/`beautifulsoup` text extraction | — |
-
-- Unknown/mismatched extension or MIME → rejected per-file with reason; **other files continue**.
-- Empty extracted text → `file-error("empty document")`, not indexed.
-- Every loader returns `LoadedDoc{ text, meta }` or raises `LoaderError(reason)` — **never** an uncaught exception to the route.
-
-### 5.2 Chunking (`rag/chunker.py`)
-
-- Recursive/character splitter with `CHUNK_SIZE` (default 1000 chars) and `CHUNK_OVERLAP` (default 150). Config-driven; no per-file-type branching beyond registry-expressible options.
-- Each chunk carries `{ file, chunk_index, char_start, char_end, text }`.
-
-### 5.3 Embeddings (`rag/embeddings.py`) — registry-driven
-
-- Provider chosen from the **Provider Registry** (§6). `embed(texts) -> np.ndarray[float32, (n, dim)]`, L2-normalized.
-- `dim` **must** match `SessionStore.dim`; a session's index dimension is fixed at creation from the active embedding model. Switching embedding models mid-session is disallowed (would invalidate vectors) — surfaced as a validation error.
-- Batched; provider errors (auth/rate-limit/timeout) mapped to readable messages.
-
-### 5.4 Retrieval + generation (`rag/index.py`, `rag/generate.py`)
-
-- **Retrieve**: embed query → `index.search(q, topK)` → map rows via DocStore → `[{text, file, chunk_index, score}]`, optional `SCORE_THRESHOLD` filter. Empty index → answer with a clear "no documents uploaded yet" notice, no LLM call.
-- **Generate**: build a grounded prompt (system instruction: "answer only from context, cite sources, say when unknown") with numbered context blocks; stream tokens via the registry-selected LLM. Emit a `citation` SSE event per used source, then `usage` (tokens if provided) and `done`.
-- Answers must be attributable: citations reference the exact retrieved chunks; the UI links inline markers `[1]`, `[2]` to expandable source cards.
-
-## 6. Provider Registry (mirrors the ephemeral-store mandate)
+## 6. Bedrock Model Registry
 
 ### 6.1 Types
 
-```py
-# providers/registry.py
-@dataclass(frozen=True)
-class EmbeddingModel:
-    id: str                    # "openai:text-embedding-3-small"
-    display_name: str
-    dim: int                   # fixes index dimensionality
-    max_batch: int
-    provider: str              # "openai" | "local" | ...
-    available: bool            # gated by env/keys at startup
+```ts
+// lib/models/types.ts
+export interface EmbeddingModelConfig {
+  id: string;                 // e.g. "amazon.titan-embed-text-v2:0"
+  displayName: string;
+  dim: number;                // FIXES the notebook's LanceDB vector dimension
+  maxBatch: number;
+  modality: 'text';           // 'multimodal' reserved (seam)
+  notes?: string[];           // verification status
+}
 
-@dataclass(frozen=True)
-class LLMModel:
-    id: str                    # "openai:gpt-4o-mini"
-    display_name: str
-    provider: str
-    context_window: int
-    supports_temperature: bool # gate the UI control + request field
-    default_temperature: float
-    available: bool
+export interface LLMModelConfig {
+  id: string;                 // e.g. "anthropic.claude-3-5-sonnet-...:0"
+  displayName: string;
+  contextWindow: number;
+  supportsTemperature: boolean;
+  defaultTemperature: number;
+}
 
-EMBEDDING_MODELS: list[EmbeddingModel] = [ ... ]   # seed §6.3
-LLM_MODELS: list[LLMModel] = [ ... ]               # seed §6.3
+export const EMBEDDING_MODELS: EmbeddingModelConfig[] = [ /* seed §6.3 */ ];
+export const LLM_MODELS: LLMModelConfig[] = [ /* seed §6.3 */ ];
 ```
 
 ### 6.2 Behavior rules
 
-- **UI**: model selectors populated from `/api/providers` (only `available` entries). Temperature slider shown only when `supports_temperature`.
-- **Validation**: `/api/query` builds request validation from the selected LLM's metadata (strip/clamp temperature for unsupported/out-of-range). **Never trust the client.**
-- **Index dimension** derives solely from the active `EmbeddingModel.dim`. No hardcoded 1536 at call sites.
-- **No provider branching at call sites**: differences live in registry metadata + a thin per-provider adapter selected by `provider`. **Adding a model = one registry entry (+ adapter only if a new provider family).**
+- **Notebook dimension is fixed at creation** from the chosen `EmbeddingModelConfig.dim`. It is **immutable once the notebook has any documents** — enforced server-side (changing it would invalidate stored vectors). Surface as a clear validation error, not a silent break.
+- **No hardcoded dims** anywhere — always `notebook.dim` derived from the registry.
+- **Temperature** control shown/sent only when `supportsTemperature`; clamped to range server-side.
+- **Adding a model = one registry entry.** Provider differences (if any new family appears) live behind the adapter.
 
-### 6.3 Seed registry (verify keys/availability at startup — flag, don't guess)
+### 6.3 Seed registry (⚠️ MUST verify IDs/dims/region availability — see CLAUDE.md; flag, don't guess)
 
-| kind | id | notes |
+| kind | id (verify) | notes |
 |---|---|---|
-| embedding | `openai:text-embedding-3-small` | dim 1536, default |
-| embedding | `local:bge-small-en-v1.5` | dim 384, offline via sentence-transformers |
-| llm | `openai:gpt-4o-mini` | temperature supported, default 0.2 |
-| llm | `local:ollama/llama3.1` | temperature supported; requires local Ollama |
+| embedding | `amazon.titan-embed-text-v2:0` | dim configurable (256/512/1024) — pick + verify; default 1024 |
+| embedding | `cohere.embed-english-v3` | dim 1024 — verify availability |
+| llm | `anthropic.claude-3-5-sonnet-20240620-v1:0` | temperature supported — verify current ID |
 
-If a provider's credentials/host are absent, mark `available: false` and surface it — do not fail requests silently.
+If an ID/dim/region can't be verified in the account, **flag to the user — do not guess.**
 
 ## 7. Frontend UX
 
 ### Layout
 
-- **App shell**: left sidebar (session dashboard) + main chat/query area. Dark-first (light supported), Tailwind + shadcn/ui + `lucide-react`, `tabular-nums` for IDs/counts.
-- **Sidebar (session dashboard)**:
-  - Session card: `sessionId` (truncated + copy), created-at, provider names (embedding + LLM).
-  - **Idle countdown**: prominent `mm:ss` ticking toward `expiresAt`; turns amber < 60s, red < 15s; resets visibly on activity. Tooltip explains the 5-minute idle rule.
-  - **Files list**: per file — name, size, status pill (`parsing / chunking / embedding / indexed / error`), chunk count; error files show the reason on hover.
-  - Totals: files, chunks, vectors, index dim.
-  - Controls: **Add files** (opens uploader), **Clear index** (keep session), **End Session** (destructive).
-- **Upload zone**: drag-and-drop + picker; multi-file; shows a per-file progress row driven by ingestion SSE (spinner → phase label → ✓ with chunk count, or ✗ with reason). Oversized files rejected inline before upload.
-- **Query/chat area**:
-  - Empty state: "Upload documents to start asking questions" with the supported-types list.
-  - Messages: user right, assistant left; markdown + syntax-highlighted code; streaming text with a subtle cursor; disabled composer + hint when index is empty.
-  - **Retrieval strip**: while retrieving, show `Searching {n} chunks…`; on answer, inline citation markers `[1]…[k]` that expand into source cards (filename, chunk #, snippet, similarity score).
-  - Composer: auto-grow textarea, Enter=send / Shift+Enter=newline, `topK` control (registry-bounded), Stop button while streaming.
-  - Errors render as inline notices in the conversation.
-- **Expired-session interstitial**: on any `410`, show a modal — "This session expired after inactivity" — with **Start new session** (creates fresh session, clears UI). Never silently lose the user.
+- **App shell**: left sidebar (notebook workspace) + main area (documents & chat). Dark-first (light supported via `next-themes`), Tailwind + shadcn/ui + `lucide-react`, `tabular-nums` for IDs/counts.
+- **Notebook switcher** (sidebar top): list of the user's notebooks (name, doc count, created), "New Notebook" button (dialog: name + embedding-model select from registry — with a note that the model is fixed once documents exist).
+- **Notebook workspace** (main, when a notebook is open):
+  - **Documents panel**: table of documents — name, size, **strategy badge**, chunk count, status pill (`queued / parsing / chunking / embedding / indexed / error`), actions (delete, re-ingest). Error rows show reason on hover.
+  - **Upload**: drag-and-drop + picker (multi-file, ≤ 50MB each; oversize rejected inline). On file select, an **ingestion settings** panel appears per file:
+    - **Chunking mode toggle**: *Auto (by file type)* vs *Custom*.
+    - In Custom: strategy select (only `applicableTo` this file type) + **schema-driven config controls** (`configSchema` → sliders/inputs/switches) with live preview of estimated chunk count where cheap.
+  - Upload → creates jobs → per-file progress rows driven by job polling/SSE (phase label → ✓ chunk count, or ✗ reason).
+  - **Chat/query area**:
+    - Empty state (no indexed docs): "Add documents to start researching."
+    - Messages: user right, assistant left; markdown + syntax-highlighted code; streaming text with subtle cursor.
+    - **Retrieval strip** while searching (`Searching {n} chunks…`); answer renders inline citation markers `[1]…[k]` expanding into **source cards** (document name, page/location from provenance, snippet, similarity score).
+    - Composer: auto-grow textarea, Enter=send / Shift+Enter=newline, `topK` control (bounded), optional document filter, Stop button while streaming.
+    - Errors render as inline notices in the conversation.
+  - **Delete Notebook** button (destructive; confirm dialog — explains it removes documents, vectors, uploads permanently).
 
-### Polish requirements
+### Polish
 
-- Skeletons for the files list and status; optimistic disable states; copy affordances on IDs.
-- Color conventions: violet = session/identity, blue = data/citations, amber = warnings/expiry-soon, red = errors/expiry.
-- Keyboard: `⌘K` focuses query, `Esc` closes modals/uploader.
+- Skeletons for notebook list, documents table, chat; optimistic disable states; copy affordances on IDs.
+- Color conventions: violet = notebook/identity, blue = data/citations, amber = warnings (e.g. model-locked), red = errors/destructive.
+- Keyboard: `⌘K` notebook switcher; `⌘Enter` send; `Esc` closes dialogs.
 - No layout shift during streaming; smooth auto-scroll with scroll-lock when scrolled up.
-- Heartbeat: client pings `/api/session/heartbeat` while the tab is focused (e.g. every 60s) so an actively-viewed-but-quiet session doesn't expire mid-read — but a hidden/closed tab lets it expire.
+- Strategy config controls are entirely **schema-driven** — a new strategy's controls appear with no UI code.
 
 ## 8. API Contracts
 
-### 8.1 Session
+All requests resolve the current user via `AuthProvider` (stub → `local-user`); every entity/path is user-scoped. Unknown/notebook-not-owned → `404`.
 
-- `POST /api/session` → `{ sessionId, createdAt, expiresAt, config: { supportedTypes, maxFileMb, maxSessionMb, ttlSeconds } }`.
-- `POST /api/session/heartbeat { sessionId }` → `{ expiresAt }` (touches). `410` if expired.
-- `GET /api/session/status?sessionId=` → `{ files[], totals, dim, providers, expiresAt }`. `410` if expired.
-- `DELETE /api/session { sessionId }` (also reachable via `sendBeacon`) → `{ ended: true }`; unknown id → `{ ended: false }` (never 5xx).
-- `POST /api/clear { sessionId }` → drops index + DocStore + files, keeps the session alive → `{ cleared: true, expiresAt }`.
+### 8.1 Notebooks
 
-### 8.2 Upload — `POST /api/upload` (multipart, SSE)
+- `POST /api/notebooks { name, embeddingModelId }` → `{ id, name, embeddingModelId, dim, createdAt }`. `dim` from registry; notebook LanceDB table provisioned lazily on first ingest.
+- `GET /api/notebooks` → `[{ id, name, docCount, createdAt }]`.
+- `GET /api/notebooks/[id]` → `{ notebook, documents[], totals: { documents, chunks }, embeddingModel, llmDefault }`.
+- `DELETE /api/notebooks/[id]` → deletes metadata + LanceDB table dir + uploads → `{ deleted: true }`.
 
-- Form: `sessionId` + `files[]`. Server streams, per file:
-  - `file-start { name, size }`
-  - `file-progress { name, phase: "parsing"|"chunking"|"embedding", pct? }`
-  - `file-indexed { name, chunks }`
-  - `file-error { name, reason }`
-  - terminal `ingest-done { indexedFiles, totalChunks, expiresAt }`
-- Caps enforced before/after; a rejected file emits `file-error` and does not abort the batch. Touches session on success.
+### 8.2 Documents & ingestion (async)
 
-### 8.3 Query — `POST /api/query` (SSE)
+- `POST /api/notebooks/[id]/documents` (multipart) — fields: `file`, `chunkingMode: 'auto'|'custom'`, `strategyId?`, `strategyConfig?(JSON)`. Validates size (≤ 50MB) + type (txt/pdf) + strategy applicability + config (zod from `configSchema`). Creates a `Document` (status `queued`) + a `Job`, starts an **in-process background task**, returns **`202 { jobId, documentId }`**. Model immutability enforced if notebook already has docs.
+- `GET /api/jobs/[id]` → `{ status, phase, processed, total, chunks?, error? }` (poll).
+- `GET /api/jobs/[id]/stream` (SSE, optional) → `job-status | file-progress { phase } | doc-indexed { chunks } | doc-error { reason } | job-done`.
+- `DELETE /api/notebooks/[id]/documents/[docId]` → removes doc metadata + deletes its rows from the LanceDB table (by `documentId` filter) → `{ deleted: true }`.
+
+### 8.3 Query — `POST /api/notebooks/[id]/query` (SSE)
 
 Request:
 
 ```json
-{ "sessionId": "…", "question": "…", "topK": 4,
+{ "question": "…", "topK": 5, "filter": { "documentId": "…?" },
   "llmModelId": "…?", "temperature": 0.2 }
 ```
 
-- `llmModelId`/`temperature` optional, registry-gated/clamped; empty index → immediate `done` with a "no documents" notice.
-- Stream: `retrieval { count }` → `text-delta { text }`* → `citation { index, file, chunkIndex, score, snippet }`* → `usage { inputTokens?, outputTokens? }` → `done`. In-stream/provider errors → `error { code, message }`.
-- Client abort cancels the fetch; server stops the LLM stream. Touches session.
+- Empty notebook → immediate `done { reason: "no_documents" }`, no LLM call.
+- Embeds query with the **notebook's** embedding model, searches its LanceDB table (top-k, optional `SCORE_THRESHOLD`, optional metadata filter), builds a grounded prompt (numbered context blocks; instruction: answer only from context, cite sources, admit unknowns), streams generation.
+- Stream: `retrieval { count }` → `text-delta { text }`* → `citation { index, documentId, documentName, page?, score, snippet }`* → `usage { inputTokens?, outputTokens? }` → `done`. Errors → `error { code, message }`.
+- Client abort cancels fetch; server aborts the Bedrock stream.
 
-### 8.4 Providers
+### 8.4 Registries (client-safe)
 
-- `GET /api/providers` → `{ embeddingModels: [{id, displayName, dim, provider, available}], llmModels: [{id, displayName, supportsTemperature, defaultTemperature, provider, available}], active: { embeddingId, llmId } }` (client-safe; no secrets).
+- `GET /api/strategies?fileType=` → applicable strategies `[{ id, displayName, description, configSchema }]` + `defaultForType`.
+- `GET /api/models` → `{ embeddingModels: [{id, displayName, dim, modality}], llmModels: [{id, displayName, supportsTemperature, defaultTemperature}] }` (no secrets).
 
 ## 9. Tech Stack
 
-- **Backend**: Python 3.11+, FastAPI + Uvicorn, `faiss-cpu`, `numpy`, Pydantic v2 (request validation), `sse-starlette` for SSE. Loaders: `pypdf`, `python-docx`, `charset-normalizer`, `selectolax`. Embeddings/LLM: `openai` SDK and/or `sentence-transformers` (local) and/or Ollama HTTP — selected by registry.
-- **Frontend**: Next.js (App Router) + TypeScript strict; Tailwind + shadcn/ui + `lucide-react` + `next-themes`; `react-markdown` + syntax highlighter; native `fetch`/`ReadableStream` for SSE. Frontend calls the FastAPI backend directly (or via Next rewrites); **no vector/LLM code in the client bundle**.
-- **No database, no auth libraries, no durable storage.** FAISS indexes and temp files only.
-- Versions pinned; `faiss-cpu` install verified per platform.
+- **Next.js (App Router) + TypeScript strict.** Node runtime for all API routes (server-only AWS + LanceDB + fs).
+- **LanceDB** via `@lancedb/lancedb` (prebuilt binaries; verify install per platform). One table per notebook, on local disk under the notebook dir.
+- **AWS SDK v3**: `@aws-sdk/client-bedrock-runtime` (InvokeModel/embeddings + streaming generation). IDs/params **verified** per CLAUDE.md; versions pinned.
+- **zod** — request validation on every route; strategy config schemas compiled to zod from `configSchema`.
+- **Loaders**: `pdf-parse`/`pdfjs-dist` (PDF → per-page text for provenance), native fs + `chardet`/`iconv-lite` for text encoding fallback. PPTX loader **not built** (seam only).
+- **UI**: Tailwind + shadcn/ui + `lucide-react` + `next-themes`; `react-markdown` + syntax highlighter; native `fetch`/`ReadableStream` for SSE.
+- **No database server, no auth libs, no Docker, no queue.** File-based repositories + LanceDB + in-process jobs.
 
 ## 10. Configuration
 
 ```bash
-# .env (from committed .env.example)
-# Session
-SESSION_TTL_SECONDS=300           # 5-minute idle expiry
-REAPER_INTERVAL_SECONDS=30
-MAX_FILE_MB=25
-MAX_SESSION_MB=100
-MAX_SESSION_CHUNKS=5000
+# .env.local (from committed .env.local.example)
+AWS_REGION=us-east-1
+AWS_PROFILE=<profile>                 # SSO: run `aws sso login` first
+DATA_DIR=./data                       # root for file repos + LanceDB tables
+DEFAULT_USER_ID=local-user            # AuthProvider stub
 
-# RAG
-CHUNK_SIZE=1000
-CHUNK_OVERLAP=150
-DEFAULT_TOP_K=4
+# Defaults (registry-overridable per notebook/document)
+DEFAULT_EMBEDDING_MODEL_ID=amazon.titan-embed-text-v2:0
+DEFAULT_LLM_MODEL_ID=anthropic.claude-3-5-sonnet-20240620-v1:0
+DEFAULT_TOP_K=5
 SCORE_THRESHOLD=0.0
-
-# Providers
-EMBEDDING_MODEL_ID=openai:text-embedding-3-small
-LLM_MODEL_ID=openai:gpt-4o-mini
-OPENAI_API_KEY=<key>              # required for openai providers
-OLLAMA_BASE_URL=http://localhost:11434   # for local providers
-
-# Frontend
-NEXT_PUBLIC_API_BASE=http://localhost:8000
+MAX_FILE_MB=50
 ```
 
-- Registry lives in code (typed data), not env; env only selects active defaults and supplies credentials.
+- Registries (strategies + models) live in **code** (typed data), not env. Env supplies region/profile/paths/defaults.
 
 ## 11. Extensibility Seams (build the shapes now)
 
-- **Shared store**: `SessionManager` behind an interface so the in-memory dict can be swapped for Redis + a shared/on-disk FAISS (or per-session mmap) to support multiple backend replicas — without touching routes.
-- **Identity**: `sessionId` is opaque; a future `useSession()` + auth layer can bind sessions to authenticated users; TTL/eviction logic unchanged.
-- **Provider registry**: add embedding/LLM models as data; new provider *families* add one adapter keyed by `provider`.
-- **Index type**: registry field to select `IndexHNSWFlat` for large sessions; `SessionStore` already isolates index construction.
-- **Reranking / hybrid search**: retrieval step is a single function — a reranker or BM25 hybrid slots in behind it.
-- **Persistence opt-in**: eviction is centralized; a "pin session" flag could snapshot an index to disk later (explicitly out of v1's ephemeral guarantee).
+- **AuthProvider** → `currentUser(): { userId }`. Stub returns `DEFAULT_USER_ID`; Cognito/Clerk impl later. All data already user-scoped.
+- **Repository interfaces** → `NotebookRepository`, `DocumentRepository`, `JobRepository`. File impls now; Postgres/Dynamo later — same methods.
+- **VectorStore** → `ensureCollection/add/search/delete`. `LanceDBVectorStore` now; `OpenSearchVectorStore` later (for serverless). QueryService depends on the interface only.
+- **Uploader** → local-disk now; presigned-S3/multipart later (for 200MB files). Route stays the same shape.
+- **IngestionQueue** → in-process task runner behind an interface; SQS/Step-Functions/Fargate-worker later. `IngestionService` doesn't care who invokes it.
+- **Loader registry** → per-type `Loader` producing `ParsedElement[]`; add PPTX/XLSX later as one loader each — all applicable strategies work immediately.
+- **Embedding modality** → `modality: 'text' | 'multimodal'`; Titan Multimodal + image chunks slot in behind `EmbeddingService` with no store/query rewrite.
 
 ## 12. Acceptance Criteria
 
-- [ ] `docker compose up` (or `make dev`) → frontend at `localhost:3000`, backend at `:8000`; loading the app creates a session with a visible countdown.
-- [ ] Uploading multiple files streams per-file progress (parsing→chunking→embedding→indexed) with chunk counts; a corrupt/empty/oversized file is rejected with a readable reason **while other files in the same batch still index**.
-- [ ] Adding more files to an existing session grows the same index; totals (files/chunks/vectors) update.
-- [ ] Querying streams a grounded answer token-by-token with inline citations that expand to show file, chunk index, snippet, and similarity score; querying an empty index returns a clear "no documents" notice without an LLM call.
-- [ ] Any successful upload/query/heartbeat resets the idle timer; `expiresAt` from the server drives the UI countdown; countdown turns amber/red as expiry approaches.
-- [ ] **Idle 5 minutes** → the session is evicted by the reaper; the next client call returns `410`, and the UI shows an expired interstitial with "Start new session". Memory freed and temp dir deleted (verifiable in logs).
-- [ ] **End Session** and **tab close** (`sendBeacon`) both free the FAISS index and delete the temp dir immediately; unknown/expired ids return a non-error `{ ended: false }`.
-- [ ] **Clear index** empties documents/vectors but keeps the session and timer.
-- [ ] Server restart starts with **zero** sessions/indexes (no persistence).
-- [ ] Temperature control appears only for registry LLMs that support it; the server strips/clamps it otherwise; index dimensionality always derives from the active embedding model's `dim` (no hardcoded dims).
-- [ ] Provider auth/rate-limit/timeout and expired-session errors render as readable in-UI messages (request-level AND in-stream); malformed files or stream events never crash the server or client.
-- [ ] No vector/embedding/LLM code ships in the client bundle.
-- [ ] Adding a model requires **ONLY** a new registry entry (plus an adapter only for a brand-new provider family).
+- [ ] `npm install` then `npm run dev` → app at `localhost:3000`; a `./data` tree is created on first write; no external servers required.
+- [ ] Create a notebook (name + embedding model) → dim fixed from registry; appears in the switcher; delete removes metadata + LanceDB table + uploads.
+- [ ] Upload txt and PDF (≤ 50MB) → each returns `202 { jobId }`; ingestion runs in the background; the documents table shows live phase progress and final chunk counts; oversize/corrupt/empty files fail **per-document** with a readable reason **without** affecting siblings or crashing the server.
+- [ ] **Auto mode** applies the default strategy per file type (PDF→`pdf_one_per_page`, txt→`recursive`); **Custom mode** shows only `applicableTo` strategies with **schema-driven** config controls; the server validates config from the strategy's `configSchema` (clamps/strips).
+- [ ] The chosen strategy + config is recorded per document and shown as a badge; re-ingesting a document with a different strategy replaces its chunks.
+- [ ] Query streams a grounded answer with inline citations that expand to show document, **page/location from provenance**, snippet, and similarity score; querying an empty notebook returns a "no documents" notice with no LLM call; Stop halts generation immediately.
+- [ ] Embedding model is **immutable once a notebook has documents** — attempting to change it is rejected with a readable error; no hardcoded vector dim exists (dim always derives from the notebook's registry model).
+- [ ] Temperature control appears only for LLMs that support it; unsupported/out-of-range values stripped/clamped server-side.
+- [ ] Layering holds: routes contain no business logic; services depend only on repository/adapter interfaces; components never see AWS/LanceDB raw shapes (verifiable by inspection).
+- [ ] **Adding a chunking strategy requires ONLY** a new `ChunkingStrategy` class + one registry entry (+ optional default-map entry) — demonstrably no UI/validation/route edits. Adding a model = one registry entry.
+- [ ] Bedrock errors (access denied, throttling, validation, timeout) and missing-notebook errors render as readable in-UI messages (request-level AND in-stream).
+- [ ] No AWS SDK / LanceDB code ships in the client bundle.
+- [ ] Deleting a document removes its vectors from the notebook's table (subsequent queries can't cite it).
 
 ## 13. Project Structure
 
 ```
-/backend
-  app.py                        # FastAPI app, lifespan (start/stop reaper), routes wiring
+/app
+  layout.tsx  page.tsx                     # console shell (sidebar + workspace)
   /api
-    session.py                  # create / heartbeat / status / delete / clear
-    upload.py                   # SSE ingestion
-    query.py                    # SSE RAG answer
-    providers.py                # client-safe registry
-  /session
-    manager.py                  # SessionManager: dict, locks, TTL, reaper, evict-all
-    store.py                    # SessionStore, DocStore, FileRecord
-  /rag
-    loaders.py                  # defensive per-type file -> text
-    chunker.py                  # text -> chunks
-    embeddings.py               # registry-driven embed()
-    index.py                    # FAISS build/add/search (per session)
-    generate.py                 # prompt build + streaming LLM adapter
-  /providers
-    registry.py                 # EmbeddingModel/LLMModel seed data
-    validate.py                 # request validation from registry
-    adapters/                   # openai.py, local.py, ollama.py
-  /lib
-    events.py                   # typed SSE event schemas (source of truth)
-    errors.py                   # provider/session error mapping
-  requirements.txt
-  .env.example
-
-/frontend
-  /app
-    page.tsx                    # console shell (sidebar + query area)
-  /components
-    /session                    # session card, countdown, files list
-    /upload                     # dropzone + per-file progress
-    /chat                       # messages, composer, citations, retrieval strip
-    /ui                         # shadcn
-  /lib
-    api.ts                      # typed backend client (fetch + SSE parsing)
-    events.ts                   # mirror of backend event union
-    useSession.ts               # session bootstrap + heartbeat + expiry handling
-  .env.example
-
-docker-compose.yml
-Makefile
-README.md
+    /notebooks/route.ts                     # POST create, GET list
+    /notebooks/[id]/route.ts                # GET open, DELETE
+    /notebooks/[id]/documents/route.ts      # POST upload → 202 { jobId }
+    /notebooks/[id]/documents/[docId]/route.ts  # DELETE doc
+    /notebooks/[id]/query/route.ts          # SSE query
+    /jobs/[id]/route.ts                     # GET job status (poll)
+    /jobs/[id]/stream/route.ts              # SSE job progress (optional)
+    /strategies/route.ts                    # client-safe strategy registry
+    /models/route.ts                        # client-safe model registry
+/lib
+  /facade
+    notebook-facade.ts                      # use-case orchestration
+  /services
+    notebook-service.ts  ingestion-service.ts  chunking-service.ts
+    embedding-service.ts query-service.ts   job-service.ts
+  /repositories
+    types.ts                                # NotebookRepository/DocumentRepository/JobRepository interfaces
+    file-notebook-repository.ts             # JSON + atomic write + lock
+    file-document-repository.ts
+    file-job-repository.ts
+    fs-util.ts                              # atomic write, per-file lock, path builders (user-scoped)
+  /adapters
+    vector-store.ts                         # VectorStore interface
+    lancedb-vector-store.ts                 # LanceDB impl
+    uploader.ts  local-disk-uploader.ts     # Uploader interface + impl
+    auth-provider.ts  stub-auth-provider.ts # AuthProvider interface + stub
+    bedrock-embedding-adapter.ts            # Bedrock embeddings + error mapping (server-only)
+    bedrock-llm-adapter.ts                  # Bedrock streaming generation + error mapping
+  /chunking
+    types.ts  registry.ts  factory.ts       # Strategy + Registry + Factory
+    /strategies
+      fixed-size.ts  recursive.ts  delimiter.ts  pdf-one-per-page.ts
+    /loaders
+      types.ts  registry.ts                 # Loader → ParsedElement[]
+      text-loader.ts  pdf-loader.ts          # (pptx-loader.ts later)
+  /models
+    types.ts  registry.ts  factory.ts       # Bedrock model registry
+  /stream
+    events.ts                               # typed SSE event union (server+client)
+  /errors
+    errors.ts                               # error taxonomy + AWS→readable mapping
+  /jobs
+    ingestion-queue.ts                      # IngestionQueue interface + in-process impl
+/components
+  /notebook   /documents   /upload   /chat   /ui
+/data                                       # created at runtime (gitignored)
+.env.local.example
 ```

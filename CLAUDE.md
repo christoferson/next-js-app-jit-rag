@@ -1,232 +1,242 @@
-# CLAUDE.md — Build Guide & Verification for the Ephemeral RAG Console
+# CLAUDE.md — Build Guide & Verification for the Notebook RAG Console
 
-This is the operational companion to `SPEC.md`. It tells you (Claude Code) **what order to build in**, **what MUST be verified before you write call sites that depend on it**, and **how to prove the ephemeral guarantees actually hold**. Read `SPEC.md` first for the *what*; this file is the *how* and the *don't-guess*.
+Operational companion to `SPEC.md`. `SPEC.md` says *what* to build; this says *how to build it, in what order, and what MUST be verified before you depend on it.* Read `SPEC.md` first.
 
 ## 0. Prime Directives
 
-1. **Never guess an API, model ID, dimension, or package capability.** If you cannot verify it (docs, a probe script, an actual import), **stop and flag it** in your output with a `⚠️ VERIFY` note. Do not write plausible-looking constants (e.g. embedding dims, model names) from memory.
-2. **The ephemeral guarantee is the product.** Any code path that creates a FAISS index or temp dir MUST have a corresponding eviction path that frees it. If you can't point to where something gets freed, it's a bug.
-3. **Defensive by default.** Loaders, stream adapters, and parsers must never raise uncaught into a route. Wrap, map to a readable reason, degrade.
-4. **Registry, not branching.** No `if provider == "openai"` at call sites. No hardcoded `1536`. If you feel the urge, add a registry field instead.
-5. **Server-only secrets.** No API keys, no embedding/LLM SDK code in the frontend bundle. The browser holds only `sessionId` + display state.
+1. **Never guess an AWS model ID, embedding dimension, SDK shape, or package capability.** If you can't verify it (official docs, a probe script, an actual import/call), **stop and flag it** with a `⚠️ VERIFY` note in your output. Do not write plausible-looking Bedrock model IDs or vector dims from memory — this is the #1 source of silent breakage.
+2. **The chunking Strategy system is the product.** Its extensibility guarantee ("add a strategy = one class + one registry entry, nothing else changes") is a hard acceptance test, not an aspiration. Prove it (§6).
+3. **Layering is enforced, not suggested.** Routes → Facade → Services → Repositories/Adapters. A violation (route touching a repo, service importing AWS SDK directly, component seeing a raw LanceDB row) is a defect (§5).
+4. **Everything is user-scoped from line one.** Every entity carries `userId`; every path is namespaced by user. The `AuthProvider` stub is the *only* place the current user is resolved.
+5. **Server-only secrets/SDKs.** No AWS SDK, no LanceDB, no `AWS_PROFILE` in the client bundle. The browser holds `notebookId` + display state only.
 
-If any instruction here conflicts with `SPEC.md`, `SPEC.md` wins on *what*, this file wins on *process*.
+If this file and `SPEC.md` conflict: `SPEC.md` wins on *what*, this wins on *process*.
 
-## 1. Environment Verification (do this FIRST, before writing features)
+## 1. Environment Verification (FIRST — before any feature code)
 
-Do not scaffold features until these pass. Record results in `/backend/VERIFICATION.md`.
+Record results in `VERIFICATION.md`. Do not build on anything here until it passes.
 
-### 1.1 `faiss-cpu` install (platform-sensitive — verify, don't assume)
+### 1.1 LanceDB (`@lancedb/lancedb`) install + round-trip
 
-`faiss-cpu` wheels are not uniformly available across Python versions / architectures (notably Apple Silicon and newer Python minors). **Verify before pinning.**
+Prebuilt binaries vary by platform/arch/Node version. Verify before pinning.
 
-```bash
-python -c "import faiss, numpy as np; \
-idx = faiss.IndexFlatIP(384); \
-v = np.random.rand(3, 384).astype('float32'); faiss.normalize_L2(v); \
-idx.add(v); \
-D, I = idx.search(v[:1], 2); \
-print('faiss OK', faiss.__version__ if hasattr(faiss,'__version__') else 'n/a', idx.ntotal, I.tolist())"
+```ts
+// scripts/verify-lancedb.ts  (run with tsx/ts-node)
+import * as lancedb from "@lancedb/lancedb";
+
+const db = await lancedb.connect("./.verify/lancedb");
+const dim = 8;
+const rows = Array.from({ length: 5 }, (_, i) => ({
+  id: `r${i}`,
+  documentId: "doc1",
+  text: `row ${i}`,
+  vector: Array.from({ length: dim }, () => Math.random()),
+}));
+const tbl = await db.createTable("probe", rows, { mode: "overwrite" });
+const q = rows[0].vector;
+const hits = await tbl.search(q).limit(3).toArray();
+console.log("lancedb OK", hits.length, hits[0]?.id);
+// also verify metadata filter + delete-by-filter (needed for doc deletion):
+await tbl.delete(`documentId = 'doc1'`);
+console.log("delete-by-filter OK", await tbl.countRows());
 ```
 
-- ✅ prints `faiss OK ... 3 [[...]]` → pin the working version in `requirements.txt`.
-- ❌ install/import fails → record the platform + Python version, try:
-  1. a different Python minor (3.11 is safest at time of writing),
-  2. conda-forge `faiss-cpu` as a fallback,
-  3. **flag to the user** with the exact error — do NOT substitute a different vector lib without asking.
+- ✅ prints results + `delete-by-filter OK 0` → pin the working version.
+- ❌ install/import/binary error → record platform + Node version; try a different Node LTS; **flag to the user with the exact error** — do NOT substitute another vector lib without asking.
+- **Verify these specific capabilities** (the app depends on them): create table, vector search with `.limit()`, **metadata filtering** (`.where(...)`), and **delete-by-filter** (for document removal). Note the exact API names — LanceDB's JS API surface has changed across versions.
 
-### 1.2 SSE library
+### 1.2 Bedrock — embeddings + streaming generation (⚠️ the critical verify)
 
-Confirm `sse-starlette`'s `EventSourceResponse` streams and that client disconnect is detectable (needed for query abort):
+Do **not** proceed on assumed model IDs or dims. Probe the actual account.
 
-```bash
-python -c "from sse_starlette.sse import EventSourceResponse; print('sse OK')"
+```ts
+// scripts/verify-bedrock.ts
+import { BedrockRuntimeClient, InvokeModelCommand,
+         InvokeModelWithResponseStreamCommand } from "@aws-sdk/client-bedrock-runtime";
+
+const client = new BedrockRuntimeClient({ region: process.env.AWS_REGION });
+
+// EMBEDDING: verify id + REAL output dimension
+const embId = process.env.DEFAULT_EMBEDDING_MODEL_ID!;
+const embRes = await client.send(new InvokeModelCommand({
+  modelId: embId,
+  body: JSON.stringify({ inputText: "hello world" /* + dimensions/normalize per model schema — VERIFY */ }),
+  contentType: "application/json", accept: "application/json",
+}));
+const embJson = JSON.parse(new TextDecoder().decode(embRes.body));
+console.log("embedding OK", embId, "REAL dim =", embJson.embedding?.length);
+// ⚠️ Assert this REAL dim matches the registry `dim`. Mismatch = silent corruption. Fail loudly.
+
+// LLM: verify id + streaming
+const llmId = process.env.DEFAULT_LLM_MODEL_ID!;
+const stream = await client.send(new InvokeModelWithResponseStreamCommand({
+  modelId: llmId,
+  body: JSON.stringify({ /* provider-specific body — VERIFY exact schema (Anthropic messages, etc.) */ }),
+  contentType: "application/json", accept: "application/json",
+}));
+for await (const ev of stream.body ?? []) {
+  if (ev.chunk) { console.log("llm chunk OK"); break; }
+}
 ```
 
-Verify in a spike route that `await request.is_disconnected()` flips when the client aborts.
+Verification checklist (record each in `VERIFICATION.md`):
+- [ ] Each embedding model ID in the registry is **invocable in this account/region**.
+- [ ] Titan V2's `dimensions` request field (256/512/1024) — **verify the exact request schema** and that the returned vector length equals what you put in the registry.
+- [ ] The **request body shape per model family** (Titan vs Cohere embeddings differ; Anthropic messages format for generation) — verify each; this is where guessing bites.
+- [ ] Streaming decode: the exact chunk envelope for the generation model (delta text location).
+- [ ] Error shapes: trigger AccessDenied (wrong model), ThrottlingException — confirm your adapter maps them (§4).
 
-### 1.3 Loader libraries
+**If any ID/dim/schema/region can't be verified → mark it `⚠️ VERIFY` and flag to the user. Do not hardcode a guess.**
 
-Import-probe each and note versions:
+### 1.3 Loaders
 
 ```bash
-python -c "import pypdf, docx, charset_normalizer, selectolax; print('loaders OK')"
+node -e "require('pdf-parse'); console.log('pdf OK')"
 ```
 
-- `python-docx` imports as `docx` (not `python_docx`) — verify.
-- If `selectolax` won't build on the platform, fall back to `beautifulsoup4` + `lxml` and note it.
+- Verify **per-page** extraction (needed for `pdf_one_per_page` provenance). `pdf-parse` gives combined text by default — confirm how to get page boundaries, or use `pdfjs-dist` page-by-page. **Flag if per-page isn't cleanly available**, since a whole strategy depends on it.
+- Text loader: verify encoding fallback (`chardet` + `iconv-lite`) on a non-UTF8 file.
 
-### 1.4 Provider availability probing (runtime, at startup)
+### 1.4 Boot without AWS
 
-Availability is **not** a guess — it's a startup probe. Build `providers/probe.py`:
+App must start and serve `/api/strategies` + `/api/models` **without** valid AWS creds (registries are static data). Only embedding/query calls require Bedrock. Verify no top-level AWS client construction crashes startup.
 
-- **OpenAI**: `available = bool(os.getenv("OPENAI_API_KEY"))`. Optionally a cheap live check (list models / tiny embed) behind a `PROBE_LIVE=1` flag — do **not** make live calls mandatory at startup (offline dev must work).
-- **Local embeddings (`sentence-transformers`)**: attempt import; `available` only if the package imports AND the model can be resolved/downloaded (or is cached). If it would trigger a multi-hundred-MB download at startup, gate behind a config flag and mark `available: false` with reason `"model not downloaded"` until fetched.
-- **Ollama**: `GET {OLLAMA_BASE_URL}/api/tags` with a short timeout; `available` only on 200 AND the target model present in the tag list.
+## 2. Build Order (bottom-up; each layer tested before the next)
 
-Rules:
-- A provider marked `available: false` MUST carry a human-readable `reason` surfaced via `/api/providers`.
-- **Verify the exact embedding dimensions from the provider, not from memory.** For `sentence-transformers`, read `model.get_sentence_embedding_dimension()`. For OpenAI, confirm the dim from the actual embedding response length on first use and assert it matches the registry `dim` — **fail loudly on mismatch** (this is a classic silent-corruption bug).
+Do not start a layer until the one below has passing tests.
 
-### 1.5 `.env` wiring
+1. **`lib/stream/events.ts`** — typed SSE event union (ingestion + query). Source of truth for both server emit and client parse.
+2. **`lib/errors/errors.ts`** — error taxonomy (`NotebookNotFound`, `ModelLocked`, `StrategyNotFound`, `LoaderError`, `OversizeFile`, Bedrock access/throttle/validation/timeout) + `toReadable()` mapping. All layers import from here.
+3. **`lib/chunking/types.ts`** — `ParsedElement`, `Chunk`, `StrategyConfigField`, `ChunkingStrategy`. **The contract everything orbits.**
+4. **`lib/chunking/strategies/*`** — `fixed_size`, `recursive`, `delimiter`, `pdf_one_per_page`. Pure functions over `ParsedElement[]`. **Test hardest here** (§7) — deterministic chunk boundaries, overlap, provenance.
+5. **`lib/chunking/registry.ts` + `factory.ts`** — registry array, `DEFAULT_STRATEGY_BY_TYPE`, factory resolving id→instance (throws `StrategyNotFound`), and config→zod compilation from `configSchema`.
+6. **`lib/chunking/loaders/*`** — `Loader` interface + `text-loader`, `pdf-loader` emitting `ParsedElement[]`. Defensive (§7).
+7. **`lib/models/*`** — registry (data) + factory. Unit: dims present, ids non-empty, `⚠️ VERIFY` notes carried.
+8. **`lib/repositories/*`** — interfaces first, then **file impls** with `fs-util` (atomic write via temp+`rename`, per-file lock, user-scoped path builders). Test concurrent read-modify-write doesn't clobber (§7).
+9. **`lib/adapters/*`** — `AuthProvider` stub, `LocalDiskUploader`, `LanceDBVectorStore` (over §1.1 verified API), `BedrockEmbeddingAdapter` + `BedrockLLMAdapter` (over §1.2 verified calls; **all AWS error mapping here**).
+10. **`lib/jobs/ingestion-queue.ts`** — `IngestionQueue` interface + in-process impl (async task runner; concurrency limit; survives per-job failure).
+11. **`lib/services/*`** — in order: `JobService`, `EmbeddingService` (asserts output dim == notebook.dim), `ChunkingService` (selection: explicit vs default-by-type), `IngestionService` (Template Method: parse→chunk→embed→store, emitting progress to JobService), `NotebookService` (lifecycle + model-immutability enforcement), `QueryService` (embed→search→prompt→stream).
+12. **`lib/facade/notebook-facade.ts`** — wire services for each use-case; own ordering (e.g. persist `Document` as `indexed` only after vectors written).
+13. **`app/api/*`** — thin routes: zod validate → `authProvider.currentUser()` → facade call → JSON or SSE. Integration-test each.
+14. **Frontend** — `lib/api.ts` (typed client + SSE parse), then `notebook` switcher, `documents` table + polling, `upload` with **schema-driven** strategy controls, `chat` with citations, then polish.
 
-Confirm the app boots with **no** provider keys set (offline mode): OpenAI models show `available: false`, local/Ollama probed. The app must not crash on startup without keys.
-
-## 2. Build Order (bottom-up; each layer testable before the next)
-
-Build and unit-test in this order. Do not start a layer until the one below it has passing tests.
-
-1. **`lib/events.py`** — typed SSE event schemas (Pydantic models). Source of truth; the frontend `events.ts` mirrors this. Write these first so every stream has a contract.
-2. **`lib/errors.py`** — error taxonomy + mapping (`SessionExpired`, `LoaderError`, provider auth/rate-limit/timeout) → `{code, message}`. All layers import from here.
-3. **`providers/registry.py`** + **`providers/probe.py`** — seed data + availability probing. Unit test: registry has ≥1 embedding + ≥1 llm; probe degrades gracefully with no keys.
-4. **`providers/validate.py`** — build request validation from registry (temperature gating/clamping, unknown model rejection, embedding-model-switch rejection). Table-test the gating.
-5. **`providers/adapters/`** — thin per-provider `embed()` / `stream_generate()`. Keep them dumb; no business logic. Mock external calls in tests.
-6. **`rag/loaders.py`** — per-type loaders + the defensive wrapper. **This is where most bad-input bugs live — test hardest here** (§4).
-7. **`rag/chunker.py`** — deterministic chunking; test char spans + overlap + tiny/empty input.
-8. **`rag/embeddings.py`** — registry-driven batched embed; asserts output dim == registry dim; L2-normalizes.
-9. **`rag/index.py`** — FAISS wrapper: `build(dim)`, `add(vecs, ids)`, `search(q, k) -> (scores, rows)`. Test round-trip retrieval on known vectors.
-10. **`session/store.py`** — `SessionStore`, `DocStore`, `FileRecord`. Test DocStore row↔metadata mapping.
-11. **`session/manager.py`** — create/get/touch/evict/reap + locks + reaper task. **Test TTL + eviction here** (§5) before any route touches it.
-12. **`rag/generate.py`** — prompt build (numbered context, grounding instruction) + streaming adapter emitting typed events. Test citation emission maps to real retrieved chunks.
-13. **`api/*` routes** — validation + wiring + SSE only. Integration-test each endpoint.
-14. **`app.py`** — lifespan (start reaper on startup, `evict-all` on shutdown), CORS for the frontend origin, route mounting.
-15. **Frontend** — `lib/api.ts` + `events.ts` + `useSession.ts` first (bootstrap/heartbeat/410 handling), then `session/`, `upload/`, `chat/` components, then polish.
-
-**Checkpoint after step 14:** you should be able to `curl` the full flow (create → upload → query → delete) before writing a single React component.
+**Checkpoint after step 13:** full flow via `curl`/script (create notebook → upload → poll job → query → delete doc → delete notebook) works headless before any React.
 
 ## 3. Layer Contracts (the non-negotiables)
 
-- **Routes** contain no FAISS, no provider SDK calls beyond invoking `rag/*`. Just Pydantic validation, `manager.get()`, `manager.touch()`, and streaming.
-- **`rag/*`** imports no FastAPI. Pure-ish; takes data, returns data or yields events.
-- **`session/*`** is the **only** place that constructs or destroys a FAISS index or a temp dir. If index creation appears anywhere else, that's a defect.
-- **Every successful route** calls `manager.touch(session_id)` and returns/streams the fresh `expiresAt`.
-- **Every route that resolves a session** calls `manager.get()`, which raises `SessionExpired` → mapped to **HTTP 410** with `{code: "session_expired"}`. No auto-recreate.
+- **Routes**: zod + auth resolve + one facade call + streaming. No LanceDB, no AWS SDK, no fs, no business logic.
+- **Facade**: orchestrates services only. No direct repo/adapter/fs/AWS calls.
+- **Services**: depend on repository/adapter **interfaces** (constructor-injected). No `import`from `app/`, no direct `@aws-sdk/*` or `@lancedb/*`.
+- **Repositories/Adapters**: the *only* code importing `@aws-sdk/*`, `@lancedb/*`, or `fs`. All AWS error mapping lives in the Bedrock adapters.
+- **Components**: consume typed DTOs from `lib/api.ts` only. Never import anything under `lib/adapters`, `lib/repositories`, or `@aws-sdk/*`.
 
-## 4. Defensive Ingestion Test Matrix (build these fixtures; they MUST all pass)
+Add an ESLint `no-restricted-imports` rule set encoding these boundaries (§5).
 
-Create `/backend/tests/fixtures/` and a test that runs the full loader→chunk→embed path per file. **The server must survive every one of these; bad files fail per-file, never crash the batch.**
+## 4. Bedrock Adapter Rules
+
+- **One place per model family** for request-body construction + response/stream decode, selected by registry metadata — **no `if (modelId === …)` in services**. If Titan vs Cohere vs Anthropic differ, that difference lives in the adapter keyed by a `family`/`modality` field on the registry entry.
+- **Assert embedding dim == notebook.dim on every batch** — throw a typed error on mismatch (catches a wrong-model or wrong-config bug before it corrupts the table).
+- **Error mapping**: `AccessDeniedException`→"Model access not enabled / credentials lack permission"; `ThrottlingException`→"Rate limited, retry shortly"; `ValidationException`→surface message; timeouts→readable. Both request-level and in-stream.
+- **Streaming abort**: the query route passes an `AbortSignal`; aborting cancels the Bedrock stream promptly (Stop button).
+
+## 5. Layering Enforcement (make violations impossible to merge)
+
+Add to ESLint config (`no-restricted-imports` / boundaries):
+
+- `app/**` may import `lib/facade/**`, `lib/stream/**`, `lib/errors/**`, `lib/models/**` (types), `lib/chunking/registry` (for schemas) — **not** `lib/repositories/**`, `lib/adapters/**`, `@aws-sdk/*`, `@lancedb/*`.
+- `lib/services/**` may import `lib/repositories/types`, `lib/adapters/*interface*`, `lib/chunking/**`, `lib/errors/**` — **not** `@aws-sdk/*`, `@lancedb/*`, `app/**`, `fs`.
+- `lib/facade/**` may import `lib/services/**`, `lib/errors/**` — **not** repositories/adapters/AWS directly.
+- `components/**` may import `lib/api`, `lib/stream/events` (types), UI libs — **not** anything under `lib/adapters`, `lib/repositories`, `@aws-sdk/*`, `@lancedb/*`.
+
+A failing lint here = a failing build. This is how "layering holds" (an acceptance criterion) is actually guaranteed.
+
+## 6. Prove the Strategy Extensibility Guarantee (core acceptance)
+
+This is *the* test that validates the product's central claim.
+
+1. Add a throwaway strategy `no_op_paragraphs` (1 chunk per paragraph) as **one class + one registry entry (+ optional default-map line)**.
+2. Assert **without touching any other file**:
+   - It appears in `GET /api/strategies?fileType=txt` with its `configSchema`.
+   - The upload UI renders its config controls (schema-driven — no UI edit needed).
+   - Server validation accepts/clamps its config (zod compiled from `configSchema`).
+   - A document ingested with it produces chunks carrying its provenance.
+3. `git diff --stat` for the feature must show **only** the new strategy file (+ ≤1 registry line + optional ≤1 default-map line). Any other changed file = the abstraction leaked; fix it before shipping.
+
+Do the equivalent one-entry check for adding a **model** to the registry.
+
+## 7. Defensive Ingestion Test Matrix (fixtures MUST all pass)
+
+`/tests/fixtures/` + a test running loader→chunk→embed(mocked)→store per file. **A bad file fails its own document; never the batch, never the server.**
 
 | Fixture | Expectation |
 |---|---|
-| `valid.pdf` (text-based) | indexed, chunk_count > 0 |
-| `scanned.pdf` (images, no text layer) | `file-error("no extractable text")`, batch continues |
-| `encrypted.pdf` | `file-error` with readable reason, no crash |
-| `empty.txt` (0 bytes) | `file-error("empty document")` |
-| `whitespace.txt` (only spaces/newlines) | `file-error("empty document")` |
-| `latin1.txt` (non-UTF8 encoding) | decoded via fallback OR clean `file-error`, never a `UnicodeDecodeError` to the route |
-| `mislabeled.pdf` (actually a PNG renamed) | rejected per-file with reason |
-| `huge.txt` (> MAX_FILE_MB) | rejected **before** parsing with cap message |
-| `valid.docx`, `valid.md`, `valid.csv`, `valid.html` | indexed |
-| `corrupt.docx` (truncated zip) | `file-error`, no crash |
-| batch of `[valid.pdf, corrupt.docx, empty.txt]` | valid.pdf indexes; other two emit `file-error`; `ingest-done` still fires |
+| `valid.txt` | indexed; chunk count > 0; provenance charStart/charEnd present |
+| `valid.pdf` (multi-page) | `pdf_one_per_page` → chunk count == page count; each chunk has `metadata.page` |
+| `empty.txt` (0 bytes) | `doc-error("empty document")`, not indexed |
+| `whitespace.txt` | `doc-error("empty document")` |
+| `latin1.txt` (non-UTF8) | decoded via fallback OR clean `doc-error` — never an uncaught decode throw |
+| `corrupt.pdf` (truncated) | `doc-error` with readable reason; no crash |
+| `image-only.pdf` (no text layer) | `doc-error("no extractable text")` |
+| `mislabeled.txt` (binary renamed) | `doc-error`, no crash |
+| `oversize.txt` (> MAX_FILE_MB) | rejected **before** parse with cap message (route-level) |
+| batch `[valid.pdf, corrupt.pdf, empty.txt]` | valid indexes; others `doc-error`; each job resolves independently |
 
-Also assert: uploading a batch that would exceed `MAX_SESSION_MB` / `MAX_SESSION_CHUNKS` is rejected with the existing index **untouched** (no partial corruption).
+Also test **chunking strategies directly** (pure, deterministic):
+- `fixed_size`: exact boundaries + overlap carry; tiny input (< size) → 1 chunk; empty → 0 chunks.
+- `recursive`: respects separators, packs up to size, never exceeds size.
+- `delimiter`: splits on literal/regex; `keepDelimiter` toggles inclusion; no empty chunks.
+- `pdf_one_per_page`: `mergeShortPages` merges pages under `minChars`; page provenance correct.
 
-## 5. Ephemeral-Guarantee Verification (the core acceptance proof)
+## 8. Repository / Concurrency Verification
 
-These are the tests that prove the product's central promise. Write them explicitly.
+- **Atomic write**: `File*Repository.save` writes to `*.tmp` then `fs.rename` (atomic on same volume). Never a partial JSON on crash.
+- **Concurrent update**: two `JobService.update(jobId)` calls in parallel don't lose writes (per-file lock via `proper-lockfile`/`async-mutex`). Test with `Promise.all` of N updates → final state consistent, count == N applied.
+- **User scoping**: path builder refuses to resolve outside `DATA_DIR/users/{userId}/…` (guard against `..` in ids). Test a malicious `notebookId`.
+- **Job progress during ingest**: worker writes progress frequently; a concurrent `GET /api/jobs/[id]` always reads a valid (atomic) snapshot.
 
-### 5.1 Idle eviction (unit, time-mocked)
+## 9. Manual End-to-End Smoke (keep in `scripts/smoke.ts`)
 
-- Set `ttl_seconds` small; create a session, add vectors, note `temp_dir`.
-- Advance mocked clock past TTL; run `manager.reap()`.
-- Assert: session id no longer in `manager.sessions`; `manager.get(id)` raises `SessionExpired`; `temp_dir` no longer exists on disk; the log line records `reason=idle` and `freed_vectors > 0`.
-
-### 5.2 Activity refresh
-
-- Create session; advance clock to `ttl - 1s`; call `touch()`; advance another `ttl - 1s`; run `reap()`.
-- Assert: session **survives** (touch reset the timer). Then advance past TTL without touching; `reap()` evicts.
-
-### 5.3 Explicit + beacon teardown
-
-- `DELETE /api/session` on a live session → `{ended: true}`, temp_dir gone, index freed.
-- `DELETE` on an unknown/already-evicted id → `{ended: false}`, **HTTP 200, never 5xx**.
-
-### 5.4 Shutdown eviction
-
-- Create N sessions; trigger the lifespan shutdown hook.
-- Assert: all temp dirs deleted; `manager.sessions` empty.
-
-### 5.5 No-persistence proof (integration)
-
-- Create session, upload, confirm vectors > 0. Kill and restart the backend process.
-- Assert: `GET /api/session/status?sessionId=<old>` → **410**; `manager.sessions` is empty; no session temp dirs remain on disk.
-
-### 5.6 Temp-dir leak audit (recipe)
-
-Run this manually and in CI-lite:
-
-```bash
-# 1. note baseline
-ls -la $TMPDIR | grep -c ragsess || true
-# 2. create + upload via curl (script below), then end session
-# 3. re-count — MUST return to baseline
-ls -la $TMPDIR | grep -c ragsess || true
+```
+1. POST /api/notebooks {name, embeddingModelId}         → notebookId, dim
+2. POST /api/notebooks/:id/documents (valid.pdf, auto)  → 202 jobId
+3. GET  /api/jobs/:jobId  (poll until job-done)          → chunks > 0
+4. GET  /api/notebooks/:id                               → document indexed, totals correct
+5. POST /api/notebooks/:id/query {question, topK:5}      → SSE: retrieval, text-delta*, citation* (with page), usage, done
+6. POST query on a FRESH empty notebook                  → done{reason:"no_documents"}, no LLM call
+7. Attempt create-doc then change embedding model        → ModelLocked error
+8. DELETE /api/notebooks/:id/documents/:docId            → doc gone; re-query cannot cite it (rows deleted from table)
+9. DELETE /api/notebooks/:id                             → dir + lancedb table + uploads removed from disk
 ```
 
-Use a recognizable temp-dir prefix (e.g. `ragsess-<uuid>`) so leaks are greppable. **Any residual `ragsess-*` dir after eviction is a failing test.**
+Verify step 9 leaves **no residual** `DATA_DIR/users/{userId}/notebooks/{id}` directory.
 
-### 5.7 Concurrency
+## 10. Frontend Verification Notes
 
-- Fire a query and an upload against the same session concurrently (asyncio tasks).
-- Assert: no index corruption (search results remain valid, `index.ntotal` consistent), thanks to the per-session lock.
+- **Schema-driven config is real**: the upload panel must render controls purely from `configSchema` returned by `/api/strategies`. Grep the components — there must be **no** per-strategy `if`/`switch` rendering. Adding a strategy shows new controls with zero UI edits (ties to §6).
+- **Job progress**: poll `GET /api/jobs/[id]` (simplest) or consume the SSE stream. Handle terminal `error` gracefully (row shows reason).
+- **SSE parsing** (query): single choke point that tolerates unknown event types (log + skip), never throws on a malformed frame. Mirror `lib/stream/events.ts` exactly.
+- **Citations**: inline `[n]` markers map to `citation` events; expanding shows document name + **page/location from provenance** + snippet + score. Verify a PDF answer cites "p.N".
+- **Stop button**: aborts the fetch; confirm the server-side Bedrock stream actually stops (not just the UI).
+- **No leakage**: grep the built client bundle for `@aws-sdk`, `@lancedb`, `AWS_PROFILE` — must be absent.
+- **Model-locked UX**: once a notebook has documents, the embedding-model selector is disabled with an amber explanation.
 
-## 6. Manual End-to-End Smoke (curl)
+## 11. Definition of Done (per feature)
 
-Keep this in `/backend/scripts/smoke.sh`. It should pass before frontend work.
+- [ ] Layering respected (ESLint boundary rules pass; §5).
+- [ ] No guessed Bedrock ID/dim/schema shipped as fact — `⚠️ VERIFY` items resolved or explicitly listed to the user (§1.2).
+- [ ] Embedding dim asserted against notebook.dim on every batch; no hardcoded dim anywhere.
+- [ ] Defensive matrix (§7) passes; no fixture crashes server or sibling docs.
+- [ ] Strategy extensibility proven by `git diff --stat` (§6) — one file (+≤2 registry lines).
+- [ ] Repository atomic-write + concurrency tests pass (§8); user-path traversal blocked.
+- [ ] Errors (parse, Bedrock access/throttle/validation/timeout, notebook-not-found, model-locked, oversize) render readable messages request-level AND in-stream.
+- [ ] No AWS/LanceDB code in the client bundle.
+- [ ] Smoke script (§9) green end-to-end, including disk cleanup on delete.
 
-```bash
-BASE=http://localhost:8000
+## 12. When to Stop and Ask (don't guess)
 
-# create
-SID=$(curl -s -X POST $BASE/api/session | tee /dev/stderr | python -c "import sys,json;print(json.load(sys.stdin)['sessionId'])")
-
-# upload (SSE — watch for file-indexed + ingest-done)
-curl -N -X POST $BASE/api/upload -F "sessionId=$SID" -F "files=@tests/fixtures/valid.pdf"
-
-# status (expect files[], totals, expiresAt)
-curl -s "$BASE/api/session/status?sessionId=$SID" | python -m json.tool
-
-# query (SSE — expect retrieval, text-delta*, citation*, done)
-curl -N -X POST $BASE/api/query -H 'content-type: application/json' \
-  -d "{\"sessionId\":\"$SID\",\"question\":\"summarize the document\",\"topK\":4}"
-
-# empty-index query on a fresh session → immediate 'done' with no-documents notice
-SID2=$(curl -s -X POST $BASE/api/session | python -c "import sys,json;print(json.load(sys.stdin)['sessionId'])")
-curl -N -X POST $BASE/api/query -H 'content-type: application/json' \
-  -d "{\"sessionId\":\"$SID2\",\"question\":\"anything\"}"
-
-# end
-curl -s -X DELETE $BASE/api/session -H 'content-type: application/json' -d "{\"sessionId\":\"$SID\"}"
-
-# expired → 410
-curl -s -o /dev/null -w "%{http_code}\n" "$BASE/api/session/status?sessionId=$SID"   # expect 410
-```
-
-## 7. Frontend Verification Notes
-
-- **`useSession.ts`** is the linchpin: bootstrap on mount, heartbeat only while `document.visibilityState === "visible"`, and a **single** place that catches `410` → shows the expired interstitial. Every API call funnels through `lib/api.ts` so 410 handling isn't scattered.
-- **sendBeacon on unload**: verify it actually fires (`DELETE` with a keepalive/beacon-compatible body). `fetch(..., {keepalive:true})` is the fallback; test both in a real browser, not just unit.
-- **Countdown authority**: the timer counts toward the server's `expiresAt`, and every successful response updates it. Never compute expiry purely client-side — the server is the source of truth.
-- **SSE parsing**: tolerate unknown event types (log + skip); never throw on a malformed frame. Mirror the server event union exactly in `events.ts`.
-- **No leakage into the bundle**: grep the built client for provider SDK names / `OPENAI_API_KEY`. Must be absent.
-
-## 8. Definition of Done (per feature, before you call it complete)
-
-- [ ] Every new FAISS index / temp dir has a proven eviction path (point to the test).
-- [ ] No hardcoded embedding dim, model id, or `if provider ==` at a call site.
-- [ ] The bad-input matrix (§4) passes; no fixture crashes the server.
-- [ ] The ephemeral tests (§5) pass, including the temp-dir leak audit and no-persistence-after-restart proof.
-- [ ] Provider unavailability (no keys / Ollama down) degrades gracefully with a surfaced reason — app still boots and serves `/api/providers`.
-- [ ] Errors (parse, provider auth/rate-limit/timeout, expired session) render readable messages both at request-level and in-stream.
-- [ ] Adding a model was (or would be) a **one-entry** registry change — confirm by actually adding a throwaway entry and seeing it appear in `/api/providers` with no other edits.
-- [ ] `⚠️ VERIFY` items are either resolved or explicitly listed for the user. **Nothing guessed shipped as fact.**
-
-## 9. When to Stop and Ask
-
-Flag to the user (don't guess) if:
-
-- `faiss-cpu` won't install on the target platform after the fallbacks in §1.1.
-- An embedding model's real dimension disagrees with what you'd have assumed (report both).
-- A provider SDK's streaming interface differs from what the adapter expects.
-- Any ephemeral-guarantee test can't be made to pass (a leak you can't close) — this is a product-defining failure, not a detail.
+Flag to the user if:
+- `@lancedb/lancedb` won't install/run on the target platform, or lacks metadata-filter / delete-by-filter on the pinned version.
+- A Bedrock model ID/dim/region can't be verified in the account, or the real embedding dim disagrees with an assumption (report both numbers).
+- A model family's request/stream schema differs from what the adapter expects.
+- `pdf-parse` can't cleanly yield per-page text (the `pdf_one_per_page` strategy depends on it) — propose `pdfjs-dist` page iteration and confirm.
+- Any layering boundary would have to be broken to make a feature work — that's a design smell; surface it rather than punching through.
