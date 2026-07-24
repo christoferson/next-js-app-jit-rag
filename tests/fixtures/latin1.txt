@@ -1,0 +1,1 @@
+café naïve résumé à la française. Deuxième paragraphe ici pour le test d'encodage des caractères spéciaux.

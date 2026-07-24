@@ -1,3 +1,5 @@
+@AGENTS.md
+
 # CLAUDE.md — Build Guide & Verification for the Notebook RAG Console
 
 Operational companion to `SPEC.md`. `SPEC.md` says *what* to build; this says *how to build it, in what order, and what MUST be verified before you depend on it.* Read `SPEC.md` first.

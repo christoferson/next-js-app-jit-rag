@@ -1,0 +1,94 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --background: #fafafa;
+  --surface: #ffffff;
+  --surface-2: #f4f4f5;
+  --border: #e4e4e7;
+  --foreground: #18181b;
+  --muted: #71717a;
+  --accent: #7c3aed; /* violet — notebook/identity */
+  --accent-soft: #ede9fe;
+  --info: #2563eb; /* blue — data/citations */
+  --info-soft: #dbeafe;
+  --warn: #d97706; /* amber — warnings */
+  --warn-soft: #fef3c7;
+  --danger: #dc2626; /* red — errors/destructive */
+  --danger-soft: #fee2e2;
+  --ok: #16a34a;
+  --ok-soft: #dcfce7;
+}
+
+.dark {
+  --background: #09090b;
+  --surface: #101013;
+  --surface-2: #18181c;
+  --border: #26262b;
+  --foreground: #e4e4e7;
+  --muted: #85858f;
+  --accent: #a78bfa;
+  --accent-soft: #2e1f52;
+  --info: #60a5fa;
+  --info-soft: #172a54;
+  --warn: #fbbf24;
+  --warn-soft: #3c2b09;
+  --danger: #f87171;
+  --danger-soft: #451717;
+  --ok: #4ade80;
+  --ok-soft: #0f3520;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-border-token: var(--border);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-ok: var(--ok);
+  --color-ok-soft: var(--ok-soft);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), system-ui, sans-serif;
+}
+
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* streaming cursor */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+.stream-cursor::after {
+  content: "▋";
+  margin-left: 2px;
+  animation: blink 1s step-start infinite;
+  color: var(--accent);
+}
+
+/* markdown inside chat */
+.prose-chat :is(p, ul, ol, pre, blockquote) { margin: 0.5rem 0; }
+.prose-chat ul { list-style: disc; padding-left: 1.25rem; }
+.prose-chat ol { list-style: decimal; padding-left: 1.25rem; }
+.prose-chat code { background: var(--surface-2); padding: 0.1rem 0.3rem; border-radius: 4px; font-size: 0.85em; }
+.prose-chat pre { background: var(--surface-2); padding: 0.75rem; border-radius: 8px; overflow-x: auto; }
+.prose-chat pre code { background: transparent; padding: 0; }
+.prose-chat a { color: var(--info); text-decoration: underline; }
+.prose-chat h1, .prose-chat h2, .prose-chat h3 { font-weight: 600; margin: 0.75rem 0 0.25rem; }
